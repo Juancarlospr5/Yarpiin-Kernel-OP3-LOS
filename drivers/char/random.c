@@ -377,27 +377,20 @@ static struct poolinfo {
 #if 0
 	/* x^2048 + x^1638 + x^1231 + x^819 + x^411 + x + 1  -- 115 */
 	{ S(2048),	1638,	1231,	819,	411,	1 },
-
 	/* x^1024 + x^817 + x^615 + x^412 + x^204 + x + 1 -- 290 */
 	{ S(1024),	817,	615,	412,	204,	1 },
-
 	/* x^1024 + x^819 + x^616 + x^410 + x^207 + x^2 + 1 -- 115 */
 	{ S(1024),	819,	616,	410,	207,	2 },
-
 	/* x^512 + x^411 + x^308 + x^208 + x^104 + x + 1 -- 225 */
 	{ S(512),	411,	308,	208,	104,	1 },
-
 	/* x^512 + x^409 + x^307 + x^206 + x^102 + x^2 + 1 -- 95 */
 	{ S(512),	409,	307,	206,	102,	2 },
 	/* x^512 + x^409 + x^309 + x^205 + x^103 + x^2 + 1 -- 95 */
 	{ S(512),	409,	309,	205,	103,	2 },
-
 	/* x^256 + x^205 + x^155 + x^101 + x^52 + x + 1 -- 125 */
 	{ S(256),	205,	155,	101,	52,	1 },
-
 	/* x^128 + x^103 + x^78 + x^51 + x^27 + x^2 + 1 -- 70 */
 	{ S(128),	103,	78,	51,	27,	2 },
-
 	/* x^64 + x^52 + x^39 + x^26 + x^14 + x + 1 -- 15 */
 	{ S(64),	52,	39,	26,	14,	1 },
 #endif
@@ -615,6 +608,22 @@ static void fast_mix(struct fast_pool *f)
 	f->pool[0] = a;  f->pool[1] = b;
 	f->pool[2] = c;  f->pool[3] = d;
 	f->count++;
+}
+
+static void process_random_ready_list(void)
+{
+	unsigned long flags;
+	struct random_ready_callback *rdy, *tmp;
+
+	spin_lock_irqsave(&random_ready_list_lock, flags);
+	list_for_each_entry_safe(rdy, tmp, &random_ready_list, list) {
+		struct module *owner = rdy->owner;
+
+		list_del_init(&rdy->list);
+		rdy->func(rdy);
+		module_put(owner);
+	}
+	spin_unlock_irqrestore(&random_ready_list_lock, flags);
 }
 
 /*
@@ -1579,7 +1588,7 @@ void get_random_bytes_arch(void *buf, int nbytes)
 
 		if (!arch_get_random_long(&v))
 			break;
-		
+
 		memcpy(p, &v, chunk);
 		p += chunk;
 		nbytes -= chunk;
