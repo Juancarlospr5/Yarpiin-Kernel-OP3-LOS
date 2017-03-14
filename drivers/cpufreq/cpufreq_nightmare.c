@@ -1,5 +1,5 @@
 /*
- * Darkness - Load Sensitive CPU Frequency Governor
+ * Nightmare - Load Sensitive CPU Frequency Governor
  *
  * Copyright (c) 2010-2016, Alucard24 <dmbaoh2@gmail.com>
  *
@@ -27,7 +27,7 @@
 #include <linux/state_notifier.h>
 #endif
 
-struct cpufreq_darkness_policyinfo {
+struct cpufreq_nightmare_policyinfo {
 	struct timer_list policy_timer;
 	struct timer_list policy_slack_timer;
 	spinlock_t load_lock; /* protects load tracking stat */
@@ -39,19 +39,19 @@ struct cpufreq_darkness_policyinfo {
 	struct rw_semaphore enable_sem;
 	bool reject_notification;
 	int governor_enabled;
-	struct cpufreq_darkness_tunables *cached_tunables;
+	struct cpufreq_nightmare_tunables *cached_tunables;
 	unsigned long *cpu_busy_times;
 };
 
 /* Protected by per-policy load_lock */
-struct cpufreq_darkness_cpuinfo {
+struct cpufreq_nightmare_cpuinfo {
 	u64 time_in_idle;
 	u64 time_in_idle_timestamp;
 	unsigned int load;
 };
 
-static DEFINE_PER_CPU(struct cpufreq_darkness_policyinfo *, polinfo);
-static DEFINE_PER_CPU(struct cpufreq_darkness_cpuinfo, cpuinfo);
+static DEFINE_PER_CPU(struct cpufreq_nightmare_policyinfo *, polinfo);
+static DEFINE_PER_CPU(struct cpufreq_nightmare_cpuinfo, cpuinfo);
 
 /* realtime thread handles frequency scaling */
 static struct task_struct *speedchange_task;
@@ -61,6 +61,16 @@ static struct mutex gov_lock;
 
 #define DEFAULT_TIMER_RATE (20 * USEC_PER_MSEC)
 #define DEFAULT_TIMER_RATE_SUSP ((unsigned long)(50 * USEC_PER_MSEC))
+
+#define FREQ_RESPONSIVENESS			1113600
+#define FREQ_RESPONSIVENESS_MAX		2150400
+
+#define FREQ_STEP_AT_MIN_FREQ		40
+#define FREQ_STEP					50
+#define FREQ_UP_BRAKE_AT_MIN_FREQ	40
+#define FREQ_UP_BRAKE				30
+#define FREQ_STEP_DEC				10
+#define FREQ_STEP_DEC_AT_MAX_FREQ	10
 #define LOAD_MODE					1
 
 enum {
@@ -69,7 +79,7 @@ enum {
 	MAXLOAD,
 };
 
-struct cpufreq_darkness_tunables {
+struct cpufreq_nightmare_tunables {
 	int usage_count;
 	/*
 	 * The sample rate of the timer used to increase frequency
@@ -89,18 +99,29 @@ struct cpufreq_darkness_tunables {
 	 * Whether to align timer windows across all CPUs.
 	 */
 	bool align_windows;
+	/*
+	 * CPUs frequency scaling
+	 */
+	int freq_for_responsiveness;
+	int freq_for_responsiveness_max;
+	int freq_up_brake_at_min_freq;
+	int freq_up_brake;
+	int freq_step_at_min_freq;
+	int freq_step;
+	int freq_step_dec;
+	int freq_step_dec_at_max_freq;
 	unsigned int load_mode;
 };
 
 /* For cases where we have single governor instance for system */
-static struct cpufreq_darkness_tunables *common_tunables;
-static struct cpufreq_darkness_tunables *cached_common_tunables;
+static struct cpufreq_nightmare_tunables *common_tunables;
+static struct cpufreq_nightmare_tunables *cached_common_tunables;
 
 static struct attribute_group *get_sysfs_attr(void);
 
 /* Round to starting jiffy of next evaluation window */
 static u64 round_to_nw_start(u64 jif,
-			     struct cpufreq_darkness_tunables *tunables)
+			     struct cpufreq_nightmare_tunables *tunables)
 {
 	unsigned long step = usecs_to_jiffies(tunables->timer_rate);
 	u64 ret;
@@ -115,12 +136,12 @@ static u64 round_to_nw_start(u64 jif,
 	return ret;
 }
 
-static void cpufreq_darkness_timer_resched(unsigned long cpu,
+static void cpufreq_nightmare_timer_resched(unsigned long cpu,
 					      bool slack_only)
 {
-	struct cpufreq_darkness_policyinfo *ppol = per_cpu(polinfo, cpu);
-	struct cpufreq_darkness_cpuinfo *pcpu;
-	struct cpufreq_darkness_tunables *tunables =
+	struct cpufreq_nightmare_policyinfo *ppol = per_cpu(polinfo, cpu);
+	struct cpufreq_nightmare_cpuinfo *pcpu;
+	struct cpufreq_nightmare_tunables *tunables =
 		ppol->policy->governor_data;
 	u64 expires;
 	unsigned long flags;
@@ -157,11 +178,11 @@ static void cpufreq_darkness_timer_resched(unsigned long cpu,
  * The policy_timer and policy_slack_timer must be deactivated when calling
  * this function.
  */
-static void cpufreq_darkness_timer_start(
-	struct cpufreq_darkness_tunables *tunables, int cpu)
+static void cpufreq_nightmare_timer_start(
+	struct cpufreq_nightmare_tunables *tunables, int cpu)
 {
-	struct cpufreq_darkness_policyinfo *ppol = per_cpu(polinfo, cpu);
-	struct cpufreq_darkness_cpuinfo *pcpu;
+	struct cpufreq_nightmare_policyinfo *ppol = per_cpu(polinfo, cpu);
+	struct cpufreq_nightmare_cpuinfo *pcpu;
 	u64 expires = round_to_nw_start(ppol->last_evaluated_jiffy, tunables);
 	unsigned long flags;
 	int i;
@@ -187,31 +208,68 @@ static void cpufreq_darkness_timer_start(
 	spin_unlock_irqrestore(&ppol->load_lock, flags);
 }
 
-static unsigned int choose_freq(struct cpufreq_policy *policy,
-					unsigned int tmp_freq)
+static void get_target_load(struct cpufreq_policy *policy, int index,
+					unsigned int *down_load, unsigned int *up_load)
 {
 	struct cpufreq_frequency_table *table;
-	struct cpufreq_frequency_table *pos;
-	unsigned int i = 0, l_freq = 0, h_freq = 0, target_freq = 0, freq;
+	int i = 0;
+
+	if (!policy)
+		return;
+
+	table = policy->freq_table;
+	for (i = (index - 1); i >= 0; i--) {
+		if (table[i].frequency != CPUFREQ_ENTRY_INVALID) {
+			*down_load = clamp_val((table[i].frequency * 100) / policy->max, 0, 100);
+			break;
+		}
+	}
+	*up_load = clamp_val((policy->cur * 100) / policy->max, 0, 100);
+}
+
+static unsigned int choose_freq(struct cpufreq_policy *policy,
+					int index, unsigned int tmp_freq, bool isup)
+{
+	struct cpufreq_frequency_table *table;
+	unsigned int l_freq = 0, h_freq = 0, target_freq = 0;
+	int i = 0;
 
 	if (!policy)
 		return 0;
 
 	tmp_freq = clamp_val(tmp_freq, policy->min, policy->max);
 	table = policy->freq_table;
-	cpufreq_for_each_valid_entry(pos, table) {
-		freq = pos->frequency;
-		i = pos - table;
-		if (freq < tmp_freq) {
-			h_freq = freq;
+	if (isup) {
+		for (i = index; (table[i].frequency != CPUFREQ_TABLE_END); i++) {
+			if (table[i].frequency != CPUFREQ_ENTRY_INVALID) {
+				if (table[i].frequency < tmp_freq) {
+					h_freq = table[i].frequency;
+				}
+				if (table[i].frequency == tmp_freq) {
+					target_freq = table[i].frequency;
+					break;
+				}
+				if (table[i].frequency > tmp_freq) {
+					l_freq = table[i].frequency;
+					break;
+				}
+			}
 		}
-		if (freq == tmp_freq) {
-			target_freq = freq;
-			break;
-		}
-		if (freq > tmp_freq) {
-			l_freq = freq;
-			break;
+	} else {
+		for (i = index; i >= 0; i--) {
+			if (table[i].frequency != CPUFREQ_ENTRY_INVALID) {
+				if (table[i].frequency > tmp_freq) {
+					l_freq = table[i].frequency;
+				}
+				if (table[i].frequency == tmp_freq) {
+					target_freq = table[i].frequency;
+					break;
+				}
+				if (table[i].frequency < tmp_freq) {
+					h_freq = table[i].frequency;
+					break;
+				}
+			}
 		}
 	}
 	if (!target_freq) {
@@ -227,9 +285,9 @@ static unsigned int choose_freq(struct cpufreq_policy *policy,
 
 static bool update_load(int cpu)
 {
-	struct cpufreq_darkness_policyinfo *ppol = per_cpu(polinfo, cpu);
-	struct cpufreq_darkness_cpuinfo *pcpu = &per_cpu(cpuinfo, cpu);
-	struct cpufreq_darkness_tunables *tunables =
+	struct cpufreq_nightmare_policyinfo *ppol = per_cpu(polinfo, cpu);
+	struct cpufreq_nightmare_cpuinfo *pcpu = &per_cpu(cpuinfo, cpu);
+	struct cpufreq_nightmare_tunables *tunables =
 		ppol->policy->governor_data;
 	u64 now;
 	u64 now_idle;
@@ -258,21 +316,25 @@ static bool update_load(int cpu)
 	return ignore;
 }
 
-static void cpufreq_darkness_timer(unsigned long data)
+static void cpufreq_nightmare_timer(unsigned long data)
 {
-	struct cpufreq_darkness_policyinfo *ppol = per_cpu(polinfo, data);
-#ifdef CONFIG_STATE_NOTIFIER
-	struct cpufreq_darkness_tunables *tunables =
+	struct cpufreq_nightmare_policyinfo *ppol = per_cpu(polinfo, data);
+	struct cpufreq_nightmare_tunables *tunables =
 		ppol->policy->governor_data;
-#endif
-	struct cpufreq_darkness_cpuinfo *pcpu;
+	struct cpufreq_nightmare_cpuinfo *pcpu;
 	struct cpufreq_govinfo govinfo;
+	unsigned int freq_for_responsiveness = tunables->freq_for_responsiveness;
+	unsigned int freq_for_responsiveness_max = tunables->freq_for_responsiveness_max;
+	int freq_step = tunables->freq_step;
+	int freq_up_brake = tunables->freq_up_brake;
+	int freq_step_dec = tunables->freq_step_dec;
 	unsigned int load_mode = tunables->load_mode;
-	unsigned int new_freq;
-	unsigned int calc_load = 0;
+	int tmp_step = 0;
+	unsigned int new_freq = 0;
+	unsigned int calc_load = 0, up_load = 0, down_load = 0;
 	unsigned long flags;
 	unsigned long max_cpu;
-	int i, fcpu, n = 0;
+	int i, fcpu, index,  n = 0;
 
 	if (!down_read_trylock(&ppol->enable_sem))
 		return;
@@ -295,6 +357,13 @@ static void cpufreq_darkness_timer(unsigned long data)
 				DEFAULT_TIMER_RATE_SUSP);
 	}
 #endif
+	/* CPUs Online Scale Frequency*/
+	if (ppol->policy->cur < freq_for_responsiveness) {
+		freq_step = tunables->freq_step_at_min_freq;
+		freq_up_brake = tunables->freq_up_brake_at_min_freq;
+	} else if (ppol->policy->cur > freq_for_responsiveness_max) {
+		freq_step_dec = tunables->freq_step_dec_at_max_freq;
+	}
 
 	max_cpu = cpumask_first(ppol->policy->cpus);
 	for_each_cpu(i, ppol->policy->related_cpus) {
@@ -332,8 +401,35 @@ static void cpufreq_darkness_timer(unsigned long data)
 					   CPUFREQ_LOAD_CHANGE, &govinfo);
 	}
 
+	/* Check for frequency increase or for frequency decrease */
 	spin_lock_irqsave(&ppol->target_freq_lock, flags);
-	new_freq = choose_freq(ppol->policy, calc_load * (ppol->policy->max / 100));
+#ifdef CONFIG_MSM_TRACK_FREQ_TARGET_INDEX
+	index = ppol->policy->cur_index;
+#else
+	index = cpufreq_frequency_table_get_index(ppol->policy, ppol->policy->cur);
+	if (index < 0) {
+		spin_unlock_irqrestore(&ppol->target_freq_lock, flags);
+		goto rearm;
+	}
+#endif
+	get_target_load(ppol->policy, index, &down_load, &up_load);
+	if (calc_load >= up_load
+		 && ppol->policy->cur < ppol->policy->max) {
+		tmp_step = (calc_load + freq_step - freq_up_brake) * 1536;
+		if (tmp_step < 0)
+			tmp_step = 0;
+
+		new_freq = choose_freq(ppol->policy, index,
+			(ppol->policy->cur + tmp_step), true);
+	} else if (calc_load < down_load
+				 && ppol->policy->cur > ppol->policy->min) {
+		tmp_step = (100 - calc_load + freq_step_dec) * 1536;
+		if (tmp_step < 0)
+			tmp_step = 0;
+
+		new_freq = choose_freq(ppol->policy, index,
+			(ppol->policy->cur < tmp_step ? 0 : ppol->policy->cur - tmp_step), false);
+	}
 	if (!new_freq) {
 		spin_unlock_irqrestore(&ppol->target_freq_lock, flags);
 		goto rearm;
@@ -348,19 +444,19 @@ static void cpufreq_darkness_timer(unsigned long data)
 
 rearm:
 	if (!timer_pending(&ppol->policy_timer))
-		cpufreq_darkness_timer_resched(data, false);
+		cpufreq_nightmare_timer_resched(data, false);
 
 exit:
 	up_read(&ppol->enable_sem);
 	return;
 }
 
-static int cpufreq_darkness_speedchange_task(void *data)
+static int cpufreq_nightmare_speedchange_task(void *data)
 {
 	unsigned int cpu;
 	cpumask_t tmp_mask;
 	unsigned long flags;
-	struct cpufreq_darkness_policyinfo *ppol;
+	struct cpufreq_nightmare_policyinfo *ppol;
 
 	while (1) {
 		set_current_state(TASK_INTERRUPTIBLE);
@@ -403,11 +499,11 @@ static int cpufreq_darkness_speedchange_task(void *data)
 	return 0;
 }
 
-static int cpufreq_darkness_notifier(
+static int cpufreq_nightmare_notifier(
 	struct notifier_block *nb, unsigned long val, void *data)
 {
 	struct cpufreq_freqs *freq = data;
-	struct cpufreq_darkness_policyinfo *ppol;
+	struct cpufreq_nightmare_policyinfo *ppol;
 	int cpu;
 	unsigned long flags;
 
@@ -437,17 +533,17 @@ static int cpufreq_darkness_notifier(
 }
 
 static struct notifier_block cpufreq_notifier_block = {
-	.notifier_call = cpufreq_darkness_notifier,
+	.notifier_call = cpufreq_nightmare_notifier,
 };
 
 #define show_store_one(file_name)					\
 static ssize_t show_##file_name(					\
-	struct cpufreq_darkness_tunables *tunables, char *buf)	\
+	struct cpufreq_nightmare_tunables *tunables, char *buf)	\
 {									\
 	return snprintf(buf, PAGE_SIZE, "%u\n", tunables->file_name);	\
 }									\
 static ssize_t store_##file_name(					\
-		struct cpufreq_darkness_tunables *tunables,		\
+		struct cpufreq_nightmare_tunables *tunables,		\
 		const char *buf, size_t count)				\
 {									\
 	int ret;							\
@@ -461,13 +557,13 @@ static ssize_t store_##file_name(					\
 }
 show_store_one(align_windows);
 
-static ssize_t show_timer_rate(struct cpufreq_darkness_tunables *tunables,
+static ssize_t show_timer_rate(struct cpufreq_nightmare_tunables *tunables,
 		char *buf)
 {
 	return sprintf(buf, "%lu\n", tunables->timer_rate);
 }
 
-static ssize_t store_timer_rate(struct cpufreq_darkness_tunables *tunables,
+static ssize_t store_timer_rate(struct cpufreq_nightmare_tunables *tunables,
 		const char *buf, size_t count)
 {
 	int ret;
@@ -489,13 +585,13 @@ static ssize_t store_timer_rate(struct cpufreq_darkness_tunables *tunables,
 	return count;
 }
 
-static ssize_t show_timer_slack(struct cpufreq_darkness_tunables *tunables,
+static ssize_t show_timer_slack(struct cpufreq_nightmare_tunables *tunables,
 		char *buf)
 {
 	return sprintf(buf, "%d\n", tunables->timer_slack_val);
 }
 
-static ssize_t store_timer_slack(struct cpufreq_darkness_tunables *tunables,
+static ssize_t store_timer_slack(struct cpufreq_nightmare_tunables *tunables,
 		const char *buf, size_t count)
 {
 	int ret;
@@ -509,13 +605,13 @@ static ssize_t store_timer_slack(struct cpufreq_darkness_tunables *tunables,
 	return count;
 }
 
-static ssize_t show_io_is_busy(struct cpufreq_darkness_tunables *tunables,
+static ssize_t show_io_is_busy(struct cpufreq_nightmare_tunables *tunables,
 		char *buf)
 {
 	return sprintf(buf, "%u\n", tunables->io_is_busy);
 }
 
-static ssize_t store_io_is_busy(struct cpufreq_darkness_tunables *tunables,
+static ssize_t store_io_is_busy(struct cpufreq_nightmare_tunables *tunables,
 		const char *buf, size_t count)
 {
 	int ret;
@@ -529,14 +625,226 @@ static ssize_t store_io_is_busy(struct cpufreq_darkness_tunables *tunables,
 	return count;
 }
 
+/* freq_for_responsiveness */
+static ssize_t show_freq_for_responsiveness(struct cpufreq_nightmare_tunables *tunables,
+		char *buf)
+{
+	return sprintf(buf, "%d\n", tunables->freq_for_responsiveness);
+}
+
+static ssize_t store_freq_for_responsiveness(struct cpufreq_nightmare_tunables *tunables,
+		const char *buf, size_t count)
+{
+	int input;
+	int ret;
+
+	ret = sscanf(buf, "%d", &input);
+	if (ret != 1)
+		return -EINVAL;
+
+	if (input == tunables->freq_for_responsiveness)
+		return count;
+
+	tunables->freq_for_responsiveness = input;
+
+	return count;
+}
+
+/* freq_for_responsiveness_max */
+static ssize_t show_freq_for_responsiveness_max(struct cpufreq_nightmare_tunables *tunables,
+		char *buf)
+{
+	return sprintf(buf, "%d\n", tunables->freq_for_responsiveness_max);
+}
+
+static ssize_t store_freq_for_responsiveness_max(struct cpufreq_nightmare_tunables *tunables,
+		const char *buf, size_t count)
+{
+	int input;
+	int ret;
+
+	ret = sscanf(buf, "%d", &input);
+	if (ret != 1)
+		return -EINVAL;
+
+	if (input == tunables->freq_for_responsiveness_max)
+		return count;
+
+	tunables->freq_for_responsiveness_max = input;
+
+	return count;
+}
+
+/* freq_step_at_min_freq */
+static ssize_t show_freq_step_at_min_freq(struct cpufreq_nightmare_tunables *tunables,
+		char *buf)
+{
+	return sprintf(buf, "%d\n", tunables->freq_step_at_min_freq);
+}
+
+static ssize_t store_freq_step_at_min_freq(struct cpufreq_nightmare_tunables *tunables,
+		const char *buf, size_t count)
+{
+	int input;
+	int ret;
+
+	ret = sscanf(buf, "%d", &input);
+	if (ret != 1)
+		return -EINVAL;
+
+	input = max(min(input,100),0);
+
+	if (input == tunables->freq_step_at_min_freq)
+		return count;
+
+	tunables->freq_step_at_min_freq = input;
+
+	return count;
+}
+
+/* freq_step */
+static ssize_t show_freq_step(struct cpufreq_nightmare_tunables *tunables,
+		char *buf)
+{
+	return sprintf(buf, "%d\n", tunables->freq_step);
+}
+
+static ssize_t store_freq_step(struct cpufreq_nightmare_tunables *tunables,
+		const char *buf, size_t count)
+{
+	int input;
+	int ret;
+
+	ret = sscanf(buf, "%d", &input);
+	if (ret != 1)
+		return -EINVAL;
+
+	input = max(min(input,100),0);
+
+	if (input == tunables->freq_step)
+		return count;
+
+	tunables->freq_step = input;
+
+	return count;
+}
+
+/* freq_up_brake_at_min_freq */
+static ssize_t show_freq_up_brake_at_min_freq(struct cpufreq_nightmare_tunables *tunables,
+		char *buf)
+{
+	return sprintf(buf, "%d\n", tunables->freq_up_brake_at_min_freq);
+}
+
+static ssize_t store_freq_up_brake_at_min_freq(struct cpufreq_nightmare_tunables *tunables,
+		const char *buf, size_t count)
+{
+	int input;
+	int ret;
+
+	ret = sscanf(buf, "%d", &input);
+	if (ret != 1)
+		return -EINVAL;
+
+	input = max(min(input,100),0);
+
+	if (input == tunables->freq_up_brake_at_min_freq)
+		return count;
+
+	tunables->freq_up_brake_at_min_freq = input;
+
+	return count;
+}
+
+/* freq_up_brake */
+static ssize_t show_freq_up_brake(struct cpufreq_nightmare_tunables *tunables,
+		char *buf)
+{
+	return sprintf(buf, "%d\n", tunables->freq_up_brake);
+}
+
+static ssize_t store_freq_up_brake(struct cpufreq_nightmare_tunables *tunables,
+		const char *buf, size_t count)
+{
+	int input;
+	int ret;
+
+	ret = sscanf(buf, "%d", &input);
+	if (ret != 1)
+		return -EINVAL;
+
+	input = max(min(input,100),0);
+
+	if (input == tunables->freq_up_brake)
+		return count;
+
+	tunables->freq_up_brake = input;
+
+	return count;
+}
+
+/* freq_step_dec */
+static ssize_t show_freq_step_dec(struct cpufreq_nightmare_tunables *tunables,
+		char *buf)
+{
+	return sprintf(buf, "%d\n", tunables->freq_step_dec);
+}
+
+static ssize_t store_freq_step_dec(struct cpufreq_nightmare_tunables *tunables,
+		const char *buf, size_t count)
+{
+	int input;
+	int ret;
+
+	ret = sscanf(buf, "%d", &input);
+	if (ret != 1)
+		return -EINVAL;
+
+	input = max(min(input,100),0);
+
+	if (input == tunables->freq_step_dec)
+		return count;
+
+	tunables->freq_step_dec = input;
+
+	return count;
+}
+
+/* freq_step_dec_at_max_freq */
+static ssize_t show_freq_step_dec_at_max_freq(struct cpufreq_nightmare_tunables *tunables,
+		char *buf)
+{
+	return sprintf(buf, "%d\n", tunables->freq_step_dec_at_max_freq);
+}
+
+static ssize_t store_freq_step_dec_at_max_freq(struct cpufreq_nightmare_tunables *tunables,
+		const char *buf, size_t count)
+{
+	int input;
+	int ret;
+
+	ret = sscanf(buf, "%d", &input);
+	if (ret != 1)
+		return -EINVAL;
+
+	input = max(min(input,100),0);
+
+	if (input == tunables->freq_step_dec_at_max_freq)
+		return count;
+
+	tunables->freq_step_dec_at_max_freq = input;
+
+	return count;
+}
+
 /* load_mode */
-static ssize_t show_load_mode(struct cpufreq_darkness_tunables *tunables,
+static ssize_t show_load_mode(struct cpufreq_nightmare_tunables *tunables,
 		char *buf)
 {
 	return sprintf(buf, "%u\n", tunables->load_mode);
 }
 
-static ssize_t store_load_mode(struct cpufreq_darkness_tunables *tunables,
+static ssize_t store_load_mode(struct cpufreq_nightmare_tunables *tunables,
 		const char *buf, size_t count)
 {
 	int input;
@@ -596,6 +904,14 @@ show_store_gov_pol_sys(timer_rate);
 show_store_gov_pol_sys(timer_slack);
 show_store_gov_pol_sys(io_is_busy);
 show_store_gov_pol_sys(align_windows);
+show_store_gov_pol_sys(freq_for_responsiveness);
+show_store_gov_pol_sys(freq_for_responsiveness_max);
+show_store_gov_pol_sys(freq_step_at_min_freq);
+show_store_gov_pol_sys(freq_step);
+show_store_gov_pol_sys(freq_up_brake_at_min_freq);
+show_store_gov_pol_sys(freq_up_brake);
+show_store_gov_pol_sys(freq_step_dec);
+show_store_gov_pol_sys(freq_step_dec_at_max_freq);
 show_store_gov_pol_sys(load_mode);
 
 #define gov_sys_attr_rw(_name)						\
@@ -614,54 +930,78 @@ gov_sys_pol_attr_rw(timer_rate);
 gov_sys_pol_attr_rw(timer_slack);
 gov_sys_pol_attr_rw(io_is_busy);
 gov_sys_pol_attr_rw(align_windows);
+gov_sys_pol_attr_rw(freq_for_responsiveness);
+gov_sys_pol_attr_rw(freq_for_responsiveness_max);
+gov_sys_pol_attr_rw(freq_step_at_min_freq);
+gov_sys_pol_attr_rw(freq_step);
+gov_sys_pol_attr_rw(freq_up_brake_at_min_freq);
+gov_sys_pol_attr_rw(freq_up_brake);
+gov_sys_pol_attr_rw(freq_step_dec);
+gov_sys_pol_attr_rw(freq_step_dec_at_max_freq);
 gov_sys_pol_attr_rw(load_mode);
 
 /* One Governor instance for entire system */
-static struct attribute *darkness_attributes_gov_sys[] = {
+static struct attribute *nightmare_attributes_gov_sys[] = {
 	&timer_rate_gov_sys.attr,
 	&timer_slack_gov_sys.attr,
 	&io_is_busy_gov_sys.attr,
 	&align_windows_gov_sys.attr,
+	&freq_for_responsiveness_gov_sys.attr,
+	&freq_for_responsiveness_max_gov_sys.attr,
+	&freq_step_at_min_freq_gov_sys.attr,
+	&freq_step_gov_sys.attr,
+	&freq_up_brake_at_min_freq_gov_sys.attr,
+	&freq_up_brake_gov_sys.attr,
+	&freq_step_dec_gov_sys.attr,
+	&freq_step_dec_at_max_freq_gov_sys.attr,
 	&load_mode_gov_sys.attr,
 	NULL,
 };
 
-static struct attribute_group darkness_attr_group_gov_sys = {
-	.attrs = darkness_attributes_gov_sys,
-	.name = "darkness",
+static struct attribute_group nightmare_attr_group_gov_sys = {
+	.attrs = nightmare_attributes_gov_sys,
+	.name = "nightmare",
 };
 
 /* Per policy governor instance */
-static struct attribute *darkness_attributes_gov_pol[] = {
+static struct attribute *nightmare_attributes_gov_pol[] = {
 	&timer_rate_gov_pol.attr,
 	&timer_slack_gov_pol.attr,
 	&io_is_busy_gov_pol.attr,
 	&align_windows_gov_pol.attr,
+	&freq_for_responsiveness_gov_pol.attr,
+	&freq_for_responsiveness_max_gov_pol.attr,
+	&freq_step_at_min_freq_gov_pol.attr,
+	&freq_step_gov_pol.attr,
+	&freq_up_brake_at_min_freq_gov_pol.attr,
+	&freq_up_brake_gov_pol.attr,
+	&freq_step_dec_gov_pol.attr,
+	&freq_step_dec_at_max_freq_gov_pol.attr,
 	&load_mode_gov_pol.attr,
 	NULL,
 };
 
-static struct attribute_group darkness_attr_group_gov_pol = {
-	.attrs = darkness_attributes_gov_pol,
-	.name = "darkness",
+static struct attribute_group nightmare_attr_group_gov_pol = {
+	.attrs = nightmare_attributes_gov_pol,
+	.name = "nightmare",
 };
 
 static struct attribute_group *get_sysfs_attr(void)
 {
 	if (have_governor_per_policy())
-		return &darkness_attr_group_gov_pol;
+		return &nightmare_attr_group_gov_pol;
 	else
-		return &darkness_attr_group_gov_sys;
+		return &nightmare_attr_group_gov_sys;
 }
 
-static void cpufreq_darkness_nop_timer(unsigned long data)
+static void cpufreq_nightmare_nop_timer(unsigned long data)
 {
 }
 
-static struct cpufreq_darkness_tunables *alloc_tunable(
+static struct cpufreq_nightmare_tunables *alloc_tunable(
 					struct cpufreq_policy *policy)
 {
-	struct cpufreq_darkness_tunables *tunables;
+	struct cpufreq_nightmare_tunables *tunables;
 
 	tunables = kzalloc(sizeof(*tunables), GFP_KERNEL);
 	if (!tunables)
@@ -672,15 +1012,23 @@ static struct cpufreq_darkness_tunables *alloc_tunable(
 	tunables->timer_rate_prev = DEFAULT_TIMER_RATE;
 #endif
 	tunables->timer_slack_val = DEFAULT_TIMER_SLACK;
+	tunables->freq_for_responsiveness = FREQ_RESPONSIVENESS;
+	tunables->freq_for_responsiveness_max = FREQ_RESPONSIVENESS_MAX;
+	tunables->freq_step_at_min_freq = FREQ_STEP_AT_MIN_FREQ;
+	tunables->freq_step = FREQ_STEP;
+	tunables->freq_up_brake_at_min_freq = FREQ_UP_BRAKE_AT_MIN_FREQ;
+	tunables->freq_up_brake = FREQ_UP_BRAKE;
+	tunables->freq_step_dec = FREQ_STEP_DEC;
+	tunables->freq_step_dec_at_max_freq = FREQ_STEP_DEC_AT_MAX_FREQ;
 	tunables->load_mode = LOAD_MODE;
 
 	return tunables;
 }
 
-static struct cpufreq_darkness_policyinfo *get_policyinfo(
+static struct cpufreq_nightmare_policyinfo *get_policyinfo(
 					struct cpufreq_policy *policy)
 {
-	struct cpufreq_darkness_policyinfo *ppol =
+	struct cpufreq_nightmare_policyinfo *ppol =
 				per_cpu(polinfo, policy->cpu);
 	int i;
 	unsigned long *busy;
@@ -702,9 +1050,9 @@ static struct cpufreq_darkness_policyinfo *get_policyinfo(
 	ppol->cpu_busy_times = busy;
 
 	init_timer_deferrable(&ppol->policy_timer);
-	ppol->policy_timer.function = cpufreq_darkness_timer;
+	ppol->policy_timer.function = cpufreq_nightmare_timer;
 	init_timer(&ppol->policy_slack_timer);
-	ppol->policy_slack_timer.function = cpufreq_darkness_nop_timer;
+	ppol->policy_slack_timer.function = cpufreq_nightmare_nop_timer;
 	spin_lock_init(&ppol->load_lock);
 	spin_lock_init(&ppol->target_freq_lock);
 	init_rwsem(&ppol->enable_sem);
@@ -717,7 +1065,7 @@ static struct cpufreq_darkness_policyinfo *get_policyinfo(
 /* This function is not multithread-safe. */
 static void free_policyinfo(int cpu)
 {
-	struct cpufreq_darkness_policyinfo *ppol = per_cpu(polinfo, cpu);
+	struct cpufreq_nightmare_policyinfo *ppol = per_cpu(polinfo, cpu);
 	int j;
 
 	if (!ppol)
@@ -731,8 +1079,8 @@ static void free_policyinfo(int cpu)
 	kfree(ppol);
 }
 
-static struct cpufreq_darkness_tunables *get_tunables(
-				struct cpufreq_darkness_policyinfo *ppol)
+static struct cpufreq_nightmare_tunables *get_tunables(
+				struct cpufreq_nightmare_policyinfo *ppol)
 {
 	if (have_governor_per_policy())
 		return ppol->cached_tunables;
@@ -740,12 +1088,12 @@ static struct cpufreq_darkness_tunables *get_tunables(
 		return cached_common_tunables;
 }
 
-static int cpufreq_governor_darkness(struct cpufreq_policy *policy,
+static int cpufreq_governor_nightmare(struct cpufreq_policy *policy,
 		unsigned int event)
 {
 	int rc;
-	struct cpufreq_darkness_policyinfo *ppol;
-	struct cpufreq_darkness_tunables *tunables;
+	struct cpufreq_nightmare_policyinfo *ppol;
+	struct cpufreq_nightmare_tunables *tunables;
 	unsigned long flags;
 
 	if (have_governor_per_policy())
@@ -837,7 +1185,7 @@ static int cpufreq_governor_darkness(struct cpufreq_policy *policy,
 		del_timer_sync(&ppol->policy_slack_timer);
 		ppol->policy_timer.data = policy->cpu;
 		ppol->last_evaluated_jiffy = get_jiffies_64();
-		cpufreq_darkness_timer_start(tunables, policy->cpu);
+		cpufreq_nightmare_timer_start(tunables, policy->cpu);
 		ppol->governor_enabled = 1;
 		up_write(&ppol->enable_sem);
 		ppol->reject_notification = false;
@@ -877,7 +1225,7 @@ static int cpufreq_governor_darkness(struct cpufreq_policy *policy,
 			spin_unlock_irqrestore(&ppol->target_freq_lock, flags);
 
 			if (policy->min < ppol->min_freq)
-				cpufreq_darkness_timer_resched(policy->cpu,
+				cpufreq_nightmare_timer_resched(policy->cpu,
 								  true);
 			ppol->min_freq = policy->min;
 		}
@@ -889,25 +1237,25 @@ static int cpufreq_governor_darkness(struct cpufreq_policy *policy,
 	return 0;
 }
 
-#ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_DARKNESS
+#ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_NIGHTMARE
 static
 #endif
-struct cpufreq_governor cpufreq_gov_darkness = {
-	.name = "darkness",
-	.governor = cpufreq_governor_darkness,
+struct cpufreq_governor cpufreq_gov_nightmare = {
+	.name = "nightmare",
+	.governor = cpufreq_governor_nightmare,
 	.max_transition_latency = 10000000,
 	.owner = THIS_MODULE,
 };
 
-static int __init cpufreq_darkness_init(void)
+static int __init cpufreq_nightmare_init(void)
 {
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 };
 
 	spin_lock_init(&speedchange_cpumask_lock);
 	mutex_init(&gov_lock);
 	speedchange_task =
-		kthread_create(cpufreq_darkness_speedchange_task, NULL,
-			       "cfdarkness");
+		kthread_create(cpufreq_nightmare_speedchange_task, NULL,
+			       "cfnightmare");
 	if (IS_ERR(speedchange_task))
 		return PTR_ERR(speedchange_task);
 
@@ -917,20 +1265,20 @@ static int __init cpufreq_darkness_init(void)
 	/* NB: wake up so the thread does not look hung to the freezer */
 	wake_up_process_no_notif(speedchange_task);
 
-	return cpufreq_register_governor(&cpufreq_gov_darkness);
+	return cpufreq_register_governor(&cpufreq_gov_nightmare);
 }
 
-#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_DARKNESS
-fs_initcall(cpufreq_darkness_init);
+#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_NIGHTMARE
+fs_initcall(cpufreq_nightmare_init);
 #else
-module_init(cpufreq_darkness_init);
+module_init(cpufreq_nightmare_init);
 #endif
 
-static void __exit cpufreq_darkness_exit(void)
+static void __exit cpufreq_nightmare_exit(void)
 {
 	int cpu;
 
-	cpufreq_unregister_governor(&cpufreq_gov_darkness);
+	cpufreq_unregister_governor(&cpufreq_gov_nightmare);
 	kthread_stop(speedchange_task);
 	put_task_struct(speedchange_task);
 
@@ -938,8 +1286,8 @@ static void __exit cpufreq_darkness_exit(void)
 		free_policyinfo(cpu);
 }
 
-module_exit(cpufreq_darkness_exit);
+module_exit(cpufreq_nightmare_exit);
 
 MODULE_AUTHOR("Alucard24 <dmbaoh2@gmail.com>");
-MODULE_DESCRIPTION("'cpufreq_darkness' - A dynamic cpufreq governor v7.0");
+MODULE_DESCRIPTION("'cpufreq_nightmare' - A dynamic cpufreq governor v5.0");
 MODULE_LICENSE("GPLv2");
