@@ -16,6 +16,7 @@
 #include <linux/debugfs.h>
 #include <linux/types.h>
 #include <linux/moduleparam.h>
+#include <linux/pm_wakeirq.h>
 #include <trace/events/power.h>
 
 #include "power.h"
@@ -24,19 +25,27 @@
 #include <linux/state_notifier.h>
 #endif
 
+static bool enable_wlan_rx_wake_ws = true;
+module_param(enable_wlan_rx_wake_ws, bool, 0644);
+static bool enable_wlan_ctrl_wake_ws = true;
+module_param(enable_wlan_ctrl_wake_ws, bool, 0644);
+static bool enable_wlan_wake_ws = true;
+module_param(enable_wlan_wake_ws, bool, 0644);
 static bool enable_qcom_rx_wakelock_ws = false;
 module_param(enable_qcom_rx_wakelock_ws, bool, 0644);
-static bool enable_wlan_extscan_wl_ws = false;
+static bool enable_wlan_extscan_wl_ws = true;
 module_param(enable_wlan_extscan_wl_ws, bool, 0644);
-static bool enable_ipa_ws = false;
-module_param(enable_ipa_ws, bool, 0644);
 static bool enable_wlan_wow_wl_ws = false;
 module_param(enable_wlan_wow_wl_ws, bool, 0644);
+static bool enable_bluedroid_timer_ws = true;
+module_param(enable_bluedroid_timer_ws, bool, 0644);
+static bool enable_ipa_ws = false;
+module_param(enable_ipa_ws, bool, 0644);
 static bool enable_wlan_ws = false;
 module_param(enable_wlan_ws, bool, 0644);
-static bool enable_timerfd_ws = false;
+static bool enable_timerfd_ws = true;
 module_param(enable_timerfd_ws, bool, 0644);
-static bool enable_netlink_ws = false;
+static bool enable_netlink_ws = true;
 module_param(enable_netlink_ws, bool, 0644);
 static bool enable_netmgr_wl_ws = false;
 module_param(enable_netmgr_wl_ws, bool, 0644);
@@ -291,6 +300,86 @@ int device_wakeup_enable(struct device *dev)
 EXPORT_SYMBOL_GPL(device_wakeup_enable);
 
 /**
+ * device_wakeup_attach_irq - Attach a wakeirq to a wakeup source
+ * @dev: Device to handle
+ * @wakeirq: Device specific wakeirq entry
+ *
+ * Attach a device wakeirq to the wakeup source so the device
+ * wake IRQ can be configured automatically for suspend and
+ * resume.
+ *
+ * Call under the device's power.lock lock.
+ */
+int device_wakeup_attach_irq(struct device *dev,
+			     struct wake_irq *wakeirq)
+{
+	struct wakeup_source *ws;
+
+	ws = dev->power.wakeup;
+	if (!ws) {
+		dev_err(dev, "forgot to call call device_init_wakeup?\n");
+		return -EINVAL;
+	}
+
+	if (ws->wakeirq)
+		return -EEXIST;
+
+	ws->wakeirq = wakeirq;
+	return 0;
+}
+
+/**
+ * device_wakeup_detach_irq - Detach a wakeirq from a wakeup source
+ * @dev: Device to handle
+ *
+ * Removes a device wakeirq from the wakeup source.
+ *
+ * Call under the device's power.lock lock.
+ */
+void device_wakeup_detach_irq(struct device *dev)
+{
+	struct wakeup_source *ws;
+
+	ws = dev->power.wakeup;
+	if (ws)
+		ws->wakeirq = NULL;
+}
+
+/**
+ * device_wakeup_arm_wake_irqs(void)
+ *
+ * Itereates over the list of device wakeirqs to arm them.
+ */
+void device_wakeup_arm_wake_irqs(void)
+{
+	struct wakeup_source *ws;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
+		if (ws->wakeirq)
+			dev_pm_arm_wake_irq(ws->wakeirq);
+	}
+	rcu_read_unlock();
+}
+
+/**
+ * device_wakeup_disarm_wake_irqs(void)
+ *
+ * Itereates over the list of device wakeirqs to disarm them.
+ */
+void device_wakeup_disarm_wake_irqs(void)
+{
+	struct wakeup_source *ws;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
+		if (ws->wakeirq)
+			dev_pm_disarm_wake_irq(ws->wakeirq);
+	}
+	rcu_read_unlock();
+}
+
+/**
  * device_wakeup_detach - Detach a device's wakeup source object from it.
  * @dev: Device to detach the wakeup source object from.
  *
@@ -489,7 +578,19 @@ static bool wakeup_source_blocker(struct wakeup_source *ws)
 			(!enable_timerfd_ws &&
 				!strncmp(ws->name, "[timerfd]", wslen)) ||
 			(!enable_netlink_ws &&
-				!strncmp(ws->name, "NETLINK", wslen))) {
+				!strncmp(ws->name, "NETLINK", wslen)) ||
+			(!enable_netmgr_wl_ws &&
+				!strncmp(ws->name, "netmgr_wl", wslen)) ||
+			(!enable_wlan_wake_ws &&
+				!strncmp(ws->name, "wlan_wake", wslen)) ||
+			(!enable_wlan_rx_wake_ws &&
+				!strncmp(ws->name, "wlan_rx_wake", wslen)) ||
+			(!enable_bluedroid_timer_ws &&
+				!strncmp(ws->name, "bluedroid_timer", wslen)) ||
+			(!enable_wlan_wow_wl_ws &&
+            	!strncmp(ws->name, "wlan_wow_wl", wslen)) ||	
+			(!enable_wlan_ctrl_wake_ws &&
+				!strncmp(ws->name, "wlan_ctrl_wake", wslen))) {
 			if (ws->active) {
 				wakeup_source_deactivate(ws);
 				pr_info("forcefully deactivate wakeup source: %s\n",
@@ -989,7 +1090,7 @@ static int print_wakeup_source_stats(struct seq_file *m,
 		active_time = ktime_set(0, 0);
 	}
 
-	ret = seq_printf(m, "%-12s\t%lu\t\t%lu\t\t%lu\t\t%lu\t\t"
+	ret = seq_printf(m, "%-32s\t%lu\t\t%lu\t\t%lu\t\t%lu\t\t"
 			"%lld\t\t%lld\t\t%lld\t\t%lld\t\t%lld\n",
 			ws->name, active_count, ws->event_count,
 			ws->wakeup_count, ws->expire_count,
@@ -1010,7 +1111,7 @@ static int wakeup_sources_stats_show(struct seq_file *m, void *unused)
 {
 	struct wakeup_source *ws;
 
-	seq_puts(m, "name\t\tactive_count\tevent_count\twakeup_count\t"
+	seq_puts(m, "name\t\t\t\t\tactive_count\tevent_count\twakeup_count\t"
 		"expire_count\tactive_since\ttotal_time\tmax_time\t"
 		"last_change\tprevent_suspend_time\n");
 
