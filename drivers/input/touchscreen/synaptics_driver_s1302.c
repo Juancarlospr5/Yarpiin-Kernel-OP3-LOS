@@ -304,7 +304,7 @@ struct synaptics_ts_data {
 
 static int tc_hw_pwron(struct synaptics_ts_data *ts)
 {
-	int rc;
+	int rc = 0;
 
 	//enable the 2v8 power
 	if (!IS_ERR(ts->vdd_2v8)) {
@@ -963,16 +963,21 @@ static int synaptics_s1302_fw_show(struct seq_file *seq, void *offset)
 }
 static ssize_t synaptics_s1302_fw_write(struct file *file, const char __user *page, size_t t, loff_t *lo)
 {
-	int val = 0;
+	char val;
+	int ret;
 	struct synaptics_ts_data *ts = tc_g;
+
     if (NULL == tc_g)
         return -EINVAL;
 	TPD_ERR("start update ******* fw_name:%s\n",tc_g->fw_name);
 	if (t > 2)
 		return -EINVAL;
 
-	sscanf(page, "%d", &val);
+	ret = copy_from_user(&val, page, sizeof(val));
+	if (ret)
+		return ret;
 
+	val -= '0';
 	if(!val)
 		val = force_update;
 	if(ts->using_polling)
@@ -1828,7 +1833,7 @@ static void synaptics_suspend_resume(struct work_struct *work)
 
 static int synaptics_parse_dts(struct device *dev, struct synaptics_ts_data *ts)
 {
-	int rc;
+	int rc = 0;
 	int retval;
 	struct device_node *np;
 
