@@ -297,8 +297,8 @@ CONFIG_SHELL := $(shell if [ -x "$$BASH" ]; then echo $$BASH; \
 
 HOSTCC       = gcc
 HOSTCXX      = g++
-HOSTCFLAGS   = -Wall -Wmissing-prototypes -Wstrict-prototypes -O3 -fomit-frame-pointer -fgcse-las
-HOSTCXXFLAGS = -O3 -fgcse-las
+HOSTCFLAGS   = -Wall -Wmissing-prototypes -Wstrict-prototypes -O3 -fno-inline-functions -fno-ipa-cp-clone -fomit-frame-pointer -fgcse-las
+HOSTCXXFLAGS = -O3 -fgcse-las -fno-inline-functions -fno-ipa-cp-clone
 
 ifeq ($(shell $(HOSTCC) -v 2>&1 | grep -c "clang version"), 1)
 HOSTCFLAGS  += -Wno-unused-value -Wno-unused-parameter \
@@ -624,7 +624,7 @@ KBUILD_CFLAGS	+= $(call cc-disable-warning,unused-const-variable,)
 ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
 KBUILD_CFLAGS	+= -Os $(call cc-disable-warning,maybe-uninitialized)
 else
-KBUILD_CFLAGS	+= -O3
+KBUILD_CFLAGS	+= -O3 -fno-inline-functions -fno-ipa-cp-clone
 KBUILD_CFLAGS	+= $(call cc-disable-warning,maybe-uninitialized)
 KBUILD_CFLAGS	+= $(call cc-disable-warning,array-bounds)
 endif
