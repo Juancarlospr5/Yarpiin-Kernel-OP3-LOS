@@ -297,8 +297,8 @@ CONFIG_SHELL := $(shell if [ -x "$$BASH" ]; then echo $$BASH; \
 
 HOSTCC       = gcc
 HOSTCXX      = g++
-HOSTCFLAGS   = -Wall -Wmissing-prototypes -Wstrict-prototypes -Ofast -fomit-frame-pointer -std=gnu89 -fgcse-las -fgraphite -floop-flatten -floop-parallelize-all -ftree-loop-linear -floop-interchange -floop-strip-mine -floop-block -pipe -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Wno-unused-variable -Wno-unused-value
-HOSTCXXFLAGS = -Ofast -fgcse-las -fgraphite -floop-flatten -floop-parallelize-all -ftree-loop-linear -floop-interchange -floop-strip-mine -floop-block -pipe
+HOSTCFLAGS   = -Wall -Wmissing-prototypes -Wstrict-prototypes -O3 -fno-inline-functions -fno-ipa-cp-clone -fomit-frame-pointer -fgcse-las
+HOSTCXXFLAGS = -O3 -fgcse-las -fno-inline-functions -fno-ipa-cp-clone
 
 ifeq ($(shell $(HOSTCC) -v 2>&1 | grep -c "clang version"), 1)
 HOSTCFLAGS  += -Wno-unused-value -Wno-unused-parameter \
@@ -410,17 +410,6 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -mcpu=cortex-a57 -mtune=cortex-a57 \
 		   -Wno-memset-transposed-args -Wno-bool-compare -Wno-logical-not-parentheses -Wno-discarded-array-qualifiers \
 		   -Wno-unused-const-variable -Wno-array-bounds -Wno-incompatible-pointer-types -Wno-misleading-indentation -Wno-tautological-compare -Wno-error=misleading-indentation
-
-# Kryo doesn't need 835769/843419 erratum fixes.
-# Some toolchains enable those fixes automatically, so opt-out.
-KBUILD_CFLAGS	+= $(call cc-option, -mno-fix-cortex-a53-835769)
-KBUILD_CFLAGS	+= $(call cc-option, -mno-fix-cortex-a53-843419)
-LDFLAGS_vmlinux	+= $(call ld-option, --no-fix-cortex-a53-835769)
-LDFLAGS_vmlinux	+= $(call ld-option, --no-fix-cortex-a53-843419)
-LDFLAGS_MODULE	+= $(call ld-option, --no-fix-cortex-a53-835769)
-LDFLAGS_MODULE	+= $(call ld-option, --no-fix-cortex-a53-843419)
-LDFLAGS		+= $(call ld-option, --no-fix-cortex-a53-835769)
-LDFLAGS		+= $(call ld-option, --no-fix-cortex-a53-843419)
 
 KBUILD_AFLAGS_KERNEL :=
 KBUILD_CFLAGS_KERNEL :=
@@ -633,11 +622,11 @@ KBUILD_CFLAGS	+= $(call cc-disable-warning,array-bounds,)
 KBUILD_CFLAGS	+= $(call cc-disable-warning,unused-const-variable,)
 
 ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
-KBUILD_CFLAGS	+= -Os $(call cc-disable-warning,maybe-uninitialized,)
+KBUILD_CFLAGS	+= -Os $(call cc-disable-warning,maybe-uninitialized)
 else
-KBUILD_CFLAGS	+= -Ofast
-KBUILD_CFLAGS += $(call cc-disable-warning,maybe-uninitialized)
-KBUILD_CFLAGS += $(call cc-disable-warning,array-bounds)
+KBUILD_CFLAGS	+= -O3 -fno-inline-functions -fno-ipa-cp-clone
+KBUILD_CFLAGS	+= $(call cc-disable-warning,maybe-uninitialized)
+KBUILD_CFLAGS	+= $(call cc-disable-warning,array-bounds)
 endif
 
 # Tell gcc to never replace conditional load with a non-conditional one
@@ -1265,7 +1254,7 @@ rpm: include/config/kernel.release FORCE
 # ---------------------------------------------------------------------------
 
 boards := $(wildcard $(srctree)/arch/$(SRCARCH)/configs/*_defconfig)
-boards := $(sort $(notdir $(boards)))
+boards := $(notdir $(boards))
 board-dirs := $(dir $(wildcard $(srctree)/arch/$(SRCARCH)/configs/*/*_defconfig))
 board-dirs := $(sort $(notdir $(board-dirs:/=)))
 
