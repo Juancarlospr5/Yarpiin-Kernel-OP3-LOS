@@ -3260,7 +3260,7 @@ int mdss_fb_atomic_commit(struct fb_info *info,
 				output_layer = commit_v1->output_layer;
 				if (!output_layer) {
 					pr_err("Output layer is null\n");
-					goto end;
+					return ret;
 				}
 				wb_change = !mdss_fb_is_wb_config_same(mfd,
 						commit_v1->output_layer);
@@ -4025,7 +4025,7 @@ static int mdss_fb_async_position_update_ioctl(struct fb_info *info,
 	ret = copy_from_user(layer_list, input_layer_list, buffer_size);
 	if (ret) {
 		pr_err("layer list copy from user failed\n");
-		goto end;
+		return ret;
 	}
 	update_pos.input_layers = layer_list;
 
@@ -4043,7 +4043,6 @@ static int mdss_fb_async_position_update_ioctl(struct fb_info *info,
 	if (rc)
 		pr_err("copy to user for layers failed");
 
-end:
 	kfree(layer_list);
 	return ret;
 }
