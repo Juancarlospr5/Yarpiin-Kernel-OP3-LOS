@@ -12,7 +12,6 @@
  * GNU General Public License for more details.
  */
 
-#define DEBUG
 #include <linux/cdev.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -409,7 +408,7 @@ static int tfa98xx_digital_mute(struct snd_soc_dai *dai, int mute)
 	struct snd_soc_codec *codec = dai->codec;
 	struct tfa98xx *tfa98xx = snd_soc_codec_get_drvdata(codec);
 
-	pr_err("state: %d\n", mute);
+	pr_debug("state: %d\n", mute);
 
 	mutex_lock(&tfa98xx->dsp_init_lock);
 
