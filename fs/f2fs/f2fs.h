@@ -2346,7 +2346,7 @@ struct f2fs_dir_entry *__f2fs_find_entry(struct inode *dir,
 			struct ci_name_buf *ci_name_bu);
 struct f2fs_dir_entry *f2fs_find_entry(struct inode *dir,
 			const struct qstr *child, struct page **res_page,
-			const struct ci_name_buf *ci_name_bu);
+			struct ci_name_buf *ci_name_bu);
 struct f2fs_dir_entry *f2fs_parent_dir(struct inode *dir, struct page **p);
 ino_t f2fs_inode_by_name(struct inode *dir, const struct qstr *qstr,
 			struct page **page);
