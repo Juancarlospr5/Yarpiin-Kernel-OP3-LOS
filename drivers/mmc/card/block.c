@@ -3526,7 +3526,18 @@ static int mmc_blk_cmdq_issue_rq(struct mmc_queue *mq, struct request *req)
 	if (ret) {
 		pr_err("%s: %s: partition switch failed %d\n",
 				md->disk->disk_name, __func__, ret);
-		goto out;
+
+		mmc_blk_cmdq_reset(host, false);
+		err = mmc_blk_cmdq_part_switch(card, md);
+		if (!err) {
+			pr_err("%s: %s: partition switch success err = %d\n",
+				md->disk->disk_name, __func__, err);
+		} else {
+			pr_err("%s: %s: partition switch failed err = %d\n",
+				md->disk->disk_name, __func__, err);
+			ret = err;
+			goto out;
+		}
 	}
 
 	if (req) {
